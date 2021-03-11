@@ -81,6 +81,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         self.everyone_done_event = asyncio.Event()
         self.server.register_handler("PREPARE", self.recv_prepare)
         self.server.register_handler("DONE", self.recv_done)
+        self.server.register_handler("INSERT", self.recv_insert)  # Client request
 
     def setup(self):
         self.initialize_log()
@@ -95,16 +96,20 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         for send in sends:
             await asyncio.wait_for(send, self.timeout)
 
-    async def start(self):
-        server_task = asyncio.create_task(super().start())
+    async def connect_to_participants(self):
         client_tasks = []
         for participant in self.participants:
             client_task = asyncio.create_task(participant.connect())
             client_tasks.append(client_task)
-        await server_task
         for client_task in client_tasks:
             await client_task
         await self.recover()
+
+    async def recv_insert(self, data):
+        sensor_id = data["sensor_id"]
+        measurement = data["measurement"]
+        timestamp = datetime.datetime.fromtimestamp(data["timestamp"])
+        await self.insert(sensor_id, measurement, timestamp)
 
     async def insert(self, sensor_id, measurement, timestamp: datetime.datetime):
         if self.insert_counter == 0:
@@ -213,10 +218,13 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
     def setup(self):
         self.initialize_log()
         with self.data_db_conn:
-            self.data_db_cur.execute("create table data"
+            self.data_db_cur.execute("create table if not exists data"
                                      "(sensor_id varchar(255) not null primary key, "
                                      " measurement int not null, "
                                      " timestamp timestamp not null)")
+
+    async def connect_to_coordinator(self):
+        await self.coordinator.connect()
 
     async def recv_begin(self, trans_id):
         self.current_trans_id = trans_id

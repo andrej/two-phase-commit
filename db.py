@@ -54,16 +54,6 @@ class DatabaseServer:
         if res != 0:
             raise DatabaseServerError("Non-zero exit flag from pg_ctl stop: {}".format(res))
 
-    @staticmethod
-    def _build_connect_arg_str(args):
-        """
-        Builds libpq connection string.
-        See https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
-        :return:
-        """
-        return " ".join("{}={}".format(k, str(v).replace("'", "\\'"))
-                        for k, v in args.items()
-                        if v)
 
     def connect(self, database):
         """
@@ -71,7 +61,7 @@ class DatabaseServer:
         """
         args = {"port": self.port,
                 "dbname": database}
-        arg_str = self._build_connect_arg_str(args)
+        arg_str = build_connect_arg_str(args)
         conn = psycopg2.connect(arg_str)
         return conn
 
@@ -92,3 +82,14 @@ class DatabaseServer:
         db_conn.close()
         db_conn = self.connect(dbname)
         return db_conn
+
+
+def build_connect_arg_str(args):
+    """
+    Builds libpq connection string.
+    See https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+    :return:
+    """
+    return " ".join("{}={}".format(k, str(v).replace("'", "\\'"))
+                    for k, v in args.items()
+                    if v)

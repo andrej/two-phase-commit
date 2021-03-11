@@ -132,9 +132,10 @@ class NodeTests(unittest.TestCase):
             await self.trackMessage(self.participant.server, "COMMIT")
             await self.trackMessage(self.participant.server, "ABORT")
 
-            await self.participant.start()
             await self.coordinator.start()
-            await self.participant.coordinator.connect()
+            await self.participant.start()
+            await self.coordinator.connect_to_participants()
+            await self.participant.connect_to_coordinator()
 
             participant_log_db_cur = self.participant_log_db.cursor()
 
