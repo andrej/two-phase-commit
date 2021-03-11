@@ -51,9 +51,8 @@ class DatabaseServer:
         if self.data_dir:
             args += ["-D", self.data_dir]
         res = subprocess.call(args)
-        if res != 0:
-            raise DatabaseServerError("Non-zero exit flag from pg_ctl stop: {}".format(res))
-
+        #if res != 0:
+        #    raise DatabaseServerError("Non-zero exit flag from pg_ctl stop: {}".format(res))
 
     def connect(self, database):
         """

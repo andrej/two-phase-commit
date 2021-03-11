@@ -1,7 +1,9 @@
 import argparse
 import asyncio
+import concurrent.futures
 import tempfile
 import shutil
+import logging
 import psycopg2
 import node
 import db
@@ -39,6 +41,7 @@ async def main():
     argparser.add_argument("--log-db", type=str, help="As for --data-db, but for log database.")
     argparser.add_argument("--timeout", type=int, help="Coordinator waits for replies from participants for this long.")
     argparser.add_argument("--batch-size", type=int, help="After N insert requests, transaction is committed.")
+    argparser.add_argument("--verbose", action="store_true", default=False, help="If flag is present, more log mesages are printed.")
     args = argparser.parse_args()
     if args.coordinator and args.participant:
         print("Cannot specify both --coordinator and --participant. To start a "
@@ -55,6 +58,10 @@ async def main():
         print("All participant nodes must be supplied with a consecutive --node-id "
               "starting from zero.")
         return 1
+
+    # Print all logs
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
 
     log_server, log_db = None, None
     data_server, data_db = None, None
@@ -91,6 +98,7 @@ async def main():
                                                       own_port,
                                                       coordinator_hostname,
                                                       coordinator_port)
+        the_node.logger.setLevel(logging.INFO)
         the_node.setup()
         try:
             await the_node.start()
@@ -111,7 +119,7 @@ async def main():
             try:
                 while True:
                     await asyncio.sleep(0)
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, concurrent.futures.CancelledError):
                 print("Killed.")
 
         finally:
@@ -129,11 +137,11 @@ async def main():
             data_db.close()
             print("Closed data database connection.")
         if log_server:
-            await log_server.stop()
+            log_server.stop()
             shutil.rmtree(log_server.data_dir)
             print("Stopped log database server and deleted cluster.")
         if data_server:
-            await data_server.stop()
+            data_server.stop()
             shutil.rmtree(data_server.stop())
             print("Stopped data database server and deleted cluster.")
 

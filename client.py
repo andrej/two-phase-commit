@@ -27,10 +27,6 @@ async def main():
         print("Connected to coordinator at {}:{}.".format(coordinator_hostname, coordinator_port))
         keep_going = True
         while keep_going:
-            print("Send another insertion request? (y/n)")
-            keep_going = (input().lower() == "y")
-            if not keep_going:
-                break
             sys.stdout.write("Sensor_ID: ")
             sensor_id = input()
             sys.stdout.write("Measurement: ")
@@ -39,6 +35,8 @@ async def main():
             sys.stdout.write("Timestamp (default now: {}): ".format(now))
             timestamp = input() or now
             await send_insert_request(coordinator, sensor_id, measurement, timestamp)
+            sys.stdout.write("Send another insertion request? (y/n) ")
+            keep_going = (input().lower() == "y")
 
     finally:
         if coordinator:

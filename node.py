@@ -1,7 +1,9 @@
 import typing
 import asyncio
+import concurrent.futures
 import time
 import datetime
+import logging
 import psycopg2.extensions
 import comm
 
@@ -24,6 +26,8 @@ class TwoPhaseCommitNode:
 
         self.log_db_cur: psycopg2.extensions.cursor = self.log_db_conn.cursor()
 
+        self.logger = logging.getLogger()
+
     async def start(self):
         await self.server.start()
 
@@ -42,11 +46,6 @@ class TwoPhaseCommitNode:
         Also deletes all completed transactions from the log, we do not need
         to keep track of them any more.
         """
-        #with self.log_db_conn:  # Context manager to make this an atomic transaction
-        #    self.log_db_cur.execute("delete from transaction_log")  # clear out everything
-        #    for trans_id, status in self.transactions:
-        #        self.log_db_cur.execute("insert into transaction_log (id, status) values(%s, %s)",
-        #                                 (trans_id, status))
         with self.log_db_conn:
             for trans_id, status in self.transactions.items():
                 self.log_db_cur.execute("insert into log (transaction_id, status) values(%s, %s) "
@@ -68,6 +67,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
 
     def __init__(self, log_db_conn, own_hostname, own_port, participants):
         super().__init__(log_db_conn, own_hostname, own_port)
+        self.logger.name = "Coordinator"
         self.participants: typing.List[comm.RemoteCallClient] = []
         for hostname, port in participants:
             self.participants.append(comm.RemoteCallClient(hostname, port))
@@ -94,7 +94,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         for participant in self.participants:
             sends.append(asyncio.create_task(participant.send(kind, data)))
         for send in sends:
-            await asyncio.wait_for(send, self.timeout)
+            await send
 
     async def connect_to_participants(self):
         client_tasks = []
@@ -109,6 +109,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         sensor_id = data["sensor_id"]
         measurement = data["measurement"]
         timestamp = datetime.datetime.fromtimestamp(data["timestamp"])
+        self.logger.info(f"Received INSERT ({sensor_id}, {measurement}, {timestamp}) request from client.")
         await self.insert(sensor_id, measurement, timestamp)
 
     async def insert(self, sensor_id, measurement, timestamp: datetime.datetime):
@@ -118,6 +119,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         participant = self.participants[node_i]
         timestamp = time.mktime(timestamp.timetuple())
         await participant.send("INSERT", (self.current_trans_id, sensor_id, measurement, timestamp))
+        self.logger.info(f"Sent INSERT ({sensor_id}, {measurement}, {timestamp}) to participant {node_i}.")
         if self.insert_counter == self.batch_size - 1:
             await self.complete_transaction()
         self.insert_counter += 1
@@ -131,15 +133,27 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         self.prepared_to_commit[self.current_trans_id] = [None] * len(self.participants)
         self.done[self.current_trans_id] = [None] * len(self.participants)
         await self.send_all("BEGIN", self.current_trans_id)
+        self.logger.info(f"Sent BEGIN to all participants.")
 
     async def recv_prepare(self, data):
         node_id, trans_id, action = data
-        if trans_id != self.current_trans_id:
-            # We've moved on past this transaction but the node crashed at old one
-            # TODO
-            await self.abort_transaction(trans_id)
+        already_committed = (trans_id not in self.transactions or
+                             self.transactions[trans_id] == "COMMITTED")
+        already_aborted = (trans_id in self.transactions and
+                           self.transactions[trans_id] == "ABORTED" or
+                           not already_committed and trans_id != self.current_trans_id)
+        if already_committed:
+            self.logger.info(f"Received PREPARED from participant {node_id} for transaction that has "
+                             f"already committed previously.")
+            await self.participants[node_id].send("COMMIT", trans_id)
+            return
+        if already_aborted:
+            self.logger.info(f"Received PREPARED from participant {node_id} for transaction that has "
+                             f"already been aborted previously.")
+            await self.participants[node_id].send("ABORT", trans_id)
             return
         self.prepared_to_commit[trans_id][node_id] = (action == "COMMIT")
+        self.logger.info(f"Received PREPARED {action} from participant {node_id}.")
         if all(x is not None for x in self.prepared_to_commit):
             self.everyone_prepared_event.set()
 
@@ -150,34 +164,43 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         self.transactions[transaction_id] = "PREPARED"
         self.write_log()
         await self.prepare_transaction(transaction_id)
-        await asyncio.wait_for(self.everyone_done_event.wait(), self.timeout)
-        if self.everyone_done_event.is_set() and transaction_id == self.current_trans_id:
-            # Can safely delete from log since everyone is done
-            del self.transactions[transaction_id]
 
     async def prepare_transaction(self, trans_id):
         await self.send_all("PREPARE", trans_id)
-        await asyncio.wait_for(self.everyone_prepared_event.wait(), self.timeout)
-        if self.everyone_prepared_event.is_set() and all(self.prepared_to_commit[self.current_trans_id]):
-            self.transactions[trans_id] = "COMMITED"
+        self.logger.info(f"Sent PREPARE {trans_id} to all participants.")
+        try:
+            await asyncio.wait_for(self.everyone_prepared_event.wait(), self.timeout)
+            do_commit = all(self.prepared_to_commit[self.current_trans_id])
+        except concurrent.futures.TimeoutError:
+            do_commit = False
+        if do_commit:
+            self.logger.info(f"Every participant replied with PREPARED COMMIT.")
+            self.transactions[trans_id] = "COMMITTED"
             self.write_log()
             await self.commit_transaction(trans_id)
         else:
+            self.logger.info(f"At least one participant replied with PREPARED ABORT or timed out before replying with "
+                             f"a PREPARED message.")
             self.transactions[trans_id] = "ABORTED"
             self.write_log()
             await self.abort_transaction(trans_id)
 
     async def commit_transaction(self, trans_id):
-        await asyncio.wait_for(self.send_all("COMMIT", trans_id), self.timeout)
+        await self.send_all("COMMIT", trans_id)
+        self.logger.info(f"Sent COMMIT to all participants.")
 
     async def abort_transaction(self, trans_id):
-        await asyncio.wait_for(self.send_all("ABORT", trans_id), self.timeout)
+        await self.send_all("ABORT", trans_id)
+        self.logger.info(f"Sent ABORT to all participants.")
 
     async def recv_done(self, data):
         node_id, trans_id = data
         self.done[trans_id][node_id] = True
-        if all(self.done[trans_id]) and trans_id == self.current_trans_id:
-            self.everyone_done_event.set()
+        self.logger.info(f"Received DONE from node {node_id}.")
+        if all(self.done[trans_id]):
+            self.logger.info(f"Everyone DONE. Removing transaction {trans_id}.")
+            del self.transactions[trans_id]
+            del self.done[trans_id]
 
     async def recover(self):
         self.read_log()
@@ -186,7 +209,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
             task = None
             if state == "PREPARED":
                 task = asyncio.create_task(self.prepare_transaction(trans_id))
-            elif state == "COMITTED":
+            elif state == "COMMITTED":
                 task = asyncio.create_task(self.commit_transaction(trans_id))
             elif state == "ABORTED":
                 task = asyncio.create_task(self.abort_transaction(trans_id))
@@ -204,6 +227,7 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
                  coordinator_hostname, coordinator_port):
         super().__init__(log_db_conn, own_hostname, own_port)
         self.node_id = node_id
+        self.logger.name = f"Participant#{self.node_id}"
         self.coordinator = comm.RemoteCallClient(coordinator_hostname, coordinator_port)
         self.data_db_conn = data_db_conn
         self.data_db_conn.autocommit = True
@@ -231,14 +255,20 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         self.current_trans_id = self.current_trans_id
         self.transactions[trans_id] = "BEGUN"
         self.data_db_cur.execute("begin")
+        self.logger.info(f"BEGAN new transaction {self.current_trans_id}.")
         return trans_id
 
     async def recv_insert(self, data):
         trans_id, sensor_id, measurement, timestamp = data
+        if trans_id != self.current_trans_id:
+            # Coordinator died before storing PREPARED, hence forgot about this
+            # transaction and all inserts we've done; need to roll back.
+            pass   # FIXME
         timestamp = datetime.datetime.fromtimestamp(timestamp)
         self.data_db_cur.execute("insert into data (sensor_id, measurement, timestamp) "
                                  "values (%s, %s, %s)",
                                  (sensor_id, measurement, timestamp))
+        self.logger.info(f"INSERT ({sensor_id}, {measurement}, {timestamp}) into database.")
 
     async def recv_prepare(self, trans_id):
         status = "COMMIT" if trans_id in self.transactions else "ABORT"
@@ -249,20 +279,23 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
             # Can just abort transaction
             await self.recv_abort(trans_id)
         await self.coordinator.send("PREPARE", (self.node_id, trans_id, status))
+        self.logger.info(f"Sent PREPARE {status} {trans_id} to coordinator.")
 
     async def recv_commit(self, trans_id):
         self.transactions[trans_id] = "COMMITTED"
         self.write_log()
-        #self.data_db_cur.execute("commit prepared %s", str(trans_id))
         self.data_db_conn.commit()
+        self.logger.info(f"COMMITTED {trans_id} into database.")
         await self.coordinator.send("DONE", (self.node_id, trans_id))
+        self.logger.info(f"Sent DONE to coordinator.")
 
     async def recv_abort(self, trans_id):
         self.transactions[trans_id] = "ABORTED"
         self.write_log()
-        #self.data_db_cur.execute("rollback prepared %s", str(trans_id))
         self.data_db_conn.rollback()
+        self.logger.info(f"ABORTED {trans_id} in database.")
         await self.coordinator.send("DONE", (self.node_id, trans_id))
+        self.logger.info(f"Sent DONE to coordinator.")
 
     async def recover(self):
         """
@@ -271,6 +304,7 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         """
         self.read_log()
         awaitables = []
+        self.logger.info(f"Recovering. {len(self.transactions)} transactions read from log.")
         for trans_id, status in self.transactions:
             # In case we decided to commit/abort, but we died before letting the
             # coordinator know, we should send the prepare message again. If the

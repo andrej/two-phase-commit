@@ -33,7 +33,6 @@ class RemoteCallUtils:
         self.server_host = server_host
         self.server_port = server_port
         self.logger: logging.Logger = logging.getLogger(f"{type(self).__name__}({self.server_host}:{self.server_port})")
-        logging.basicConfig(level=logging.INFO)
 
     def encode(self, pyobj):
         return json.dumps(pyobj).encode(self.encoding) + self.msg_separator
@@ -80,14 +79,14 @@ class RemoteCallClient(RemoteCallUtils):
     async def send(self, kind, data=None):
         if not self.writer:
             raise RuntimeError("Need to establish connection with server through connect() first.")
-        self.logger.info(f"Sending remote call message to {self.server_host}:{self.server_port} of kind '{kind}'.")
+        self.logger.info(f"Sending remote call message to {self.server_host}:{self.server_port} of kind '{kind}': {json.dumps(data)}")
         serialized = self.encode_message(kind, data)
         self.writer.write(serialized)
         await self.writer.drain()
         try:
             raw_ret = await self.reader.readuntil(self.msg_separator)
-            self.logger.info(f"Server replied.")
             ret = self.decode(raw_ret)
+            self.logger.info("Server replied: {}".format(json.dumps(ret)))
             return ret
         except (asyncio.streams.IncompleteReadError, json.JSONDecodeError, ) as e:
             self.logger.error(f"Unexpected response from server.")
@@ -147,17 +146,17 @@ class RemoteCallServer(RemoteCallUtils):
             data_bytes: bytes = await reader.readuntil(self.msg_separator)
         except asyncio.streams.IncompleteReadError:
             return
-        self.logger.info("Got request!")
         try:
             kind, data = self.decode_message(data_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError) as e:
             self.logger.error("Got invalid request.")
             self.logger.error(str(e))
             return
+        self.logger.info(f"Got request of kind '{kind}': {json.dumps(data)}")
         if kind not in self.handlers:
             self.logger.error(f"No handler registered for '{kind}'.")
             return
         return_value = await self.handlers[kind](data)
-        self.logger.error(f"Callback for {kind} returned with exit value {return_value}.")
+        self.logger.info(f"Callback for '{kind}' returned with exit value {return_value}.")
         writer.write(self.encode(return_value))
         await writer.drain()
