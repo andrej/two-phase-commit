@@ -27,6 +27,8 @@ def connect_or_create_db(arg, name):
 
 async def main():
 
+    logging.basicConfig(level=logging.ERROR)
+
     # Argument preprocessing
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--host", type=util.hostname_port_type, required=True,
@@ -39,7 +41,8 @@ async def main():
     argparser.add_argument("--data-db", type=str, help="Connection URI for data database; if none given, "
                                                        "a new database cluster will be started.")
     argparser.add_argument("--log-db", type=str, help="As for --data-db, but for log database.")
-    argparser.add_argument("--timeout", type=int, help="Coordinator waits for replies from participants for this long.")
+    argparser.add_argument("--timeout", type=int, default=10,
+                           help="Nodes wait for replies from participants for this long.")
     argparser.add_argument("--batch-size", type=int, help="After N insert requests, transaction is committed.")
     argparser.add_argument("--verbose", action="store_true", default=False, help="If flag is present, more log mesages are printed.")
     args = argparser.parse_args()
@@ -58,10 +61,6 @@ async def main():
         print("All participant nodes must be supplied with a consecutive --node-id "
               "starting from zero.")
         return 1
-
-    # Print all logs
-    if args.verbose:
-        logging.basicConfig(level=logging.INFO)
 
     log_server, log_db = None, None
     data_server, data_db = None, None
@@ -84,9 +83,8 @@ async def main():
             the_node = node.TwoPhaseCommitCoordinator(log_db,
                                                       own_hostname,
                                                       own_port,
-                                                      args.participant)
-            if args.timeout:
-                the_node.timeout = args.timeout
+                                                      args.participant,
+                                                      timeout=args.timeout)
             if args.batch_size:
                 the_node.batch_size = args.batch_size
         else:
@@ -97,24 +95,21 @@ async def main():
                                                       own_hostname,
                                                       own_port,
                                                       coordinator_hostname,
-                                                      coordinator_port)
+                                                      coordinator_port,
+                                                      timeout=args.timeout)
         the_node.logger.setLevel(logging.INFO)
+        if not args.verbose:
+            the_node.server.logger.setLevel(logging.ERROR)
+            if is_coordinator:
+                for participant in the_node.participants:
+                    participant.logger.setLevel(logging.ERROR)
+            else:
+                the_node.coordinator.logger.setLevel(logging.ERROR)
         the_node.setup()
         try:
             await the_node.start()
             print("{} node listening on {}:{}.".format("Coordinator" if is_coordinator else "Participant",
                                                        own_hostname, own_port))
-            do_connect = False
-            while not do_connect:
-                print("Ready to connect to {}? (y/n)".format("participants" if is_coordinator else
-                                                             "coordinator"))
-                do_connect = (input().lower() == "y")
-            if is_coordinator:
-                await the_node.connect_to_participants()
-                print("Connected to all participants.")
-            else:
-                await the_node.connect_to_coordinator()
-                print("Connected to coordinator.")
 
             try:
                 while True:
@@ -142,7 +137,7 @@ async def main():
             print("Stopped log database server and deleted cluster.")
         if data_server:
             data_server.stop()
-            shutil.rmtree(data_server.stop())
+            shutil.rmtree(data_server.data_dir)
             print("Stopped data database server and deleted cluster.")
 
 

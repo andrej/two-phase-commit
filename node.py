@@ -65,13 +65,15 @@ class TwoPhaseCommitNode:
 
 class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
 
-    def __init__(self, log_db_conn, own_hostname, own_port, participants):
+    def __init__(self, log_db_conn, own_hostname, own_port, participants, timeout=10):
         super().__init__(log_db_conn, own_hostname, own_port)
         self.logger.name = "Coordinator"
         self.participants: typing.List[comm.RemoteCallClient] = []
+        self.timeout = timeout
         for hostname, port in participants:
-            self.participants.append(comm.RemoteCallClient(hostname, port))
-        self.timeout = 10
+            participant = comm.RemoteCallClient(hostname, port)
+            participant.timeout = self.timeout
+            self.participants.append(participant)
         self.current_trans_id = None
         self.insert_counter = 0
         self.batch_size = 3
@@ -86,24 +88,19 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
     def setup(self):
         self.initialize_log()
 
+    async def start(self):
+        await super().start()
+        await self.recover()
+
     async def send_all(self, kind, data):
         """
         Send a message to all participants.
         """
         sends = []
         for participant in self.participants:
-            sends.append(asyncio.create_task(participant.send(kind, data)))
+            sends.append(asyncio.create_task(participant.send_timeout(kind, data)))
         for send in sends:
             await send
-
-    async def connect_to_participants(self):
-        client_tasks = []
-        for participant in self.participants:
-            client_task = asyncio.create_task(participant.connect())
-            client_tasks.append(client_task)
-        for client_task in client_tasks:
-            await client_task
-        await self.recover()
 
     async def recv_insert(self, data):
         sensor_id = data["sensor_id"]
@@ -118,7 +115,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         node_i = (hash(sensor_id) + hash(timestamp)) % len(self.participants)
         participant = self.participants[node_i]
         timestamp = time.mktime(timestamp.timetuple())
-        await participant.send("INSERT", (self.current_trans_id, sensor_id, measurement, timestamp))
+        await participant.send_timeout("INSERT", (self.current_trans_id, sensor_id, measurement, timestamp))
         self.logger.info(f"Sent INSERT ({sensor_id}, {measurement}, {timestamp}) to participant {node_i}.")
         if self.insert_counter == self.batch_size - 1:
             await self.complete_transaction()
@@ -145,12 +142,12 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         if already_committed:
             self.logger.info(f"Received PREPARED from participant {node_id} for transaction that has "
                              f"already committed previously.")
-            await self.participants[node_id].send("COMMIT", trans_id)
+            await self.participants[node_id].send_timeout("COMMIT", trans_id)
             return
         if already_aborted:
             self.logger.info(f"Received PREPARED from participant {node_id} for transaction that has "
                              f"already been aborted previously.")
-            await self.participants[node_id].send("ABORT", trans_id)
+            await self.participants[node_id].send_timeout("ABORT", trans_id)
             return
         self.prepared_to_commit[trans_id][node_id] = (action == "COMMIT")
         self.logger.info(f"Received PREPARED {action} from participant {node_id}.")
@@ -158,6 +155,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
             self.everyone_prepared_event.set()
 
     async def complete_transaction(self):
+        self.insert_counter = 0
         transaction_id = self.current_trans_id
         # Send request-to-prepare messages
         # Write prepare to log (forced)
@@ -224,11 +222,14 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
     def __init__(self, node_id: int,
                  data_db_conn: psycopg2.extensions.connection, log_db_conn: psycopg2.extensions.connection,
                  own_hostname, own_port,
-                 coordinator_hostname, coordinator_port):
+                 coordinator_hostname, coordinator_port,
+                 timeout=10):
         super().__init__(log_db_conn, own_hostname, own_port)
         self.node_id = node_id
         self.logger.name = f"Participant#{self.node_id}"
         self.coordinator = comm.RemoteCallClient(coordinator_hostname, coordinator_port)
+        self.timeout = timeout
+        self.coordinator.timeout = self.timeout
         self.data_db_conn = data_db_conn
         self.data_db_conn.autocommit = True
         self.data_db_cur = self.data_db_conn.cursor()
@@ -247,8 +248,9 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
                                      " measurement int not null, "
                                      " timestamp timestamp not null)")
 
-    async def connect_to_coordinator(self):
-        await self.coordinator.connect()
+    async def start(self):
+        await super().start()
+        await self.recover()
 
     async def recv_begin(self, trans_id):
         self.current_trans_id = trans_id
@@ -271,14 +273,16 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         self.logger.info(f"INSERT ({sensor_id}, {measurement}, {timestamp}) into database.")
 
     async def recv_prepare(self, trans_id):
-        status = "COMMIT" if trans_id in self.transactions else "ABORT"
-        if status == "COMMIT":
+        do_commit = (trans_id in self.transactions and
+                     self.transactions[trans_id] != "ABORTED")
+        status = "COMMIT" if do_commit else "ABORT"
+        if do_commit:
             self.transactions[trans_id] = "PREPARED"
             self.write_log()
         else:
             # Can just abort transaction
             await self.recv_abort(trans_id)
-        await self.coordinator.send("PREPARE", (self.node_id, trans_id, status))
+        await self.coordinator.send_timeout("PREPARE", (self.node_id, trans_id, status))
         self.logger.info(f"Sent PREPARE {status} {trans_id} to coordinator.")
 
     async def recv_commit(self, trans_id):
@@ -286,15 +290,16 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         self.write_log()
         self.data_db_conn.commit()
         self.logger.info(f"COMMITTED {trans_id} into database.")
-        await self.coordinator.send("DONE", (self.node_id, trans_id))
+        await self.coordinator.send_timeout("DONE", (self.node_id, trans_id))
         self.logger.info(f"Sent DONE to coordinator.")
 
     async def recv_abort(self, trans_id):
         self.transactions[trans_id] = "ABORTED"
         self.write_log()
-        self.data_db_conn.rollback()
-        self.logger.info(f"ABORTED {trans_id} in database.")
-        await self.coordinator.send("DONE", (self.node_id, trans_id))
+        if trans_id == self.current_trans_id:
+            self.data_db_conn.rollback()
+            self.logger.info(f"ABORTED {trans_id} in database.")
+        await self.coordinator.send_timeout("DONE", (self.node_id, trans_id))
         self.logger.info(f"Sent DONE to coordinator.")
 
     async def recover(self):
@@ -310,10 +315,10 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
             # coordinator know, we should send the prepare message again. If the
             # message has reached the coordinator already, it will just be ignored.
             if status == "PREPARED":
-                self.recv_prepare(trans_id)
+                awaitables.append(asyncio.create_task(self.recv_prepare(trans_id)))
             elif status == "COMMITTED":
-                self.recv_commit(trans_id)
+                awaitables.append(asyncio.create_task(self.recv_commit(trans_id)))
             elif status == "ABORTED":
-                self.recv_abort(trans_id)
+                awaitables.append(asyncio.create_task(self.recv_abort(trans_id)))
         for awaitable in awaitables:
             await awaitable

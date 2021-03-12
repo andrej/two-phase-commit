@@ -17,6 +17,7 @@ Author: André Rösti
 """
 import typing
 import asyncio
+import concurrent.futures
 import json
 import logging
 
@@ -66,31 +67,49 @@ class RemoteCallClient(RemoteCallUtils):
         super().__init__(server_host, server_port)
         self.reader: typing.Optional[asyncio.streams.StreamReader] = None
         self.writer: typing.Optional[asyncio.streams.StreamWriter] = None
+        self.timeout = 10
 
     async def connect(self):
-        self.reader, self.writer = await asyncio.open_connection(self.server_host, self.server_port)
+        try:
+            self.reader, self.writer = await asyncio.open_connection(self.server_host, self.server_port)
+            return True
+        except OSError:
+            self.logger.error(f"Cannot connect to {self.server_host}:{self.server_port}.")
+            return False
 
     async def disconnect(self):
         self.writer.write_eof()
         await self.writer.drain()
         self.writer.close()
         await self.writer.wait_closed()
+        self.writer = None
+        self.reader = None
 
     async def send(self, kind, data=None):
-        if not self.writer:
-            raise RuntimeError("Need to establish connection with server through connect() first.")
+        if not self.writer or self.writer.is_closing():
+            success = await self.connect()
+            if not success:
+                return None
         self.logger.info(f"Sending remote call message to {self.server_host}:{self.server_port} of kind '{kind}': {json.dumps(data)}")
         serialized = self.encode_message(kind, data)
-        self.writer.write(serialized)
-        await self.writer.drain()
+        ret = None
         try:
+            self.writer.write(serialized)
+            await self.writer.drain()
             raw_ret = await self.reader.readuntil(self.msg_separator)
             ret = self.decode(raw_ret)
             self.logger.info("Server replied: {}".format(json.dumps(ret)))
-            return ret
         except (asyncio.streams.IncompleteReadError, json.JSONDecodeError, ) as e:
             self.logger.error(f"Unexpected response from server.")
             self.logger.error(str(e))
+        finally:
+            await self.disconnect()
+        return ret
+
+    async def send_timeout(self, kind, data=None):
+        try:
+            return await asyncio.wait_for(self.send(kind, data), self.timeout)
+        except concurrent.futures.TimeoutError:
             return None
 
 
