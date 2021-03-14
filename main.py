@@ -105,17 +105,14 @@ async def main():
                     participant.logger.setLevel(logging.ERROR)
             else:
                 the_node.coordinator.logger.setLevel(logging.ERROR)
-        the_node.setup()
+        await the_node.setup()
         try:
             await the_node.start()
             print("{} node listening on {}:{}.".format("Coordinator" if is_coordinator else "Participant",
                                                        own_hostname, own_port))
 
-            try:
-                while True:
-                    await asyncio.sleep(0)
-            except (KeyboardInterrupt, concurrent.futures.CancelledError):
-                print("Killed.")
+            while True:
+                await asyncio.sleep(0)
 
         finally:
             await the_node.stop()
@@ -142,4 +139,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, concurrent.futures.CancelledError):
+        print("Killed.")

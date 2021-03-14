@@ -32,7 +32,8 @@ async def main():
         measurement = input()
         now = time.time()
         sys.stdout.write("Timestamp (default now: {}): ".format(now))
-        timestamp = float(input()) or now
+        inp = input()
+        timestamp = float(inp) if inp else now
         await send_insert_request(coordinator, sensor_id, measurement, timestamp)
         sys.stdout.write("Send another insertion request? (y/n) ")
         keep_going = (input().lower() == "y")

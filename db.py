@@ -23,6 +23,7 @@ class DatabaseServer:
     def __init__(self, data_dir=None, port=None):
         self.data_dir = data_dir
         self.port = port
+        self.options = {"max_prepared_transactions": 99}
 
     def make(self):
         """
@@ -41,6 +42,9 @@ class DatabaseServer:
         args += [self.pg_ctl_bin, "start"]
         if self.data_dir:
             args += ["-D", self.data_dir]
+        if self.options:
+            options = " ".join(f"-c {k}={v}" for k, v in self.options.items())
+            args += ["-o", options]
         res = subprocess.call(args)
         if res != 0:
             raise DatabaseServerError("Non-zero exit flag from pg_ctl start: {}".format(res))

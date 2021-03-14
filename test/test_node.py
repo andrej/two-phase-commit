@@ -1,3 +1,4 @@
+import concurrent.futures
 import unittest
 import asyncio
 import tempfile
@@ -8,11 +9,14 @@ import psycopg2
 import psycopg2.extensions
 import db
 import node
+import logging
 
 
 class NodeTests(unittest.TestCase):
 
     def setUp(self):
+        logging.basicConfig(level=logging.INFO)
+
         try:
 
             # Dictionary to keep track of counts messages received
@@ -44,6 +48,18 @@ class NodeTests(unittest.TestCase):
             self.tearDown()
             raise
 
+    async def async_setup(self):
+        await self.coordinator.setup()
+        await self.participant.setup()
+        await self.trackMessage(self.coordinator.server, "PREPARE")
+        await self.trackMessage(self.coordinator.server, "DONE")
+        await self.trackMessage(self.participant.server, "INSERT")
+        await self.trackMessage(self.participant.server, "PREPARE")
+        await self.trackMessage(self.participant.server, "COMMIT")
+        await self.trackMessage(self.participant.server, "ABORT")
+        await self.coordinator.start()
+        await self.participant.start()
+
     def tearDown(self):
         for remote_call_obj in self.message_events:
             for kind in self.message_events[remote_call_obj]:
@@ -72,7 +88,7 @@ class NodeTests(unittest.TestCase):
             cb, event = self.message_events[rco_id][kind]
             retval = await old_cb(data)
             event.set()
-            #await asyncio.sleep(0)  # yield to waiting asserts
+            await asyncio.sleep(0)  # yield to waiting asserts
             return retval
 
         remote_call_obj.handlers[kind] = msg_wrapper
@@ -87,7 +103,10 @@ class NodeTests(unittest.TestCase):
     async def assertAwaitMessage(self, remote_call_obj, kind, timeout=10):
         rco_id = id(remote_call_obj)
         old_cb, event = self.message_events[rco_id][kind]
-        await asyncio.wait_for(event.wait(), timeout)
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except concurrent.futures.TimeoutError:
+            pass
         self.assertTrue(event.is_set())
         event.clear()
 
@@ -116,26 +135,15 @@ class NodeTests(unittest.TestCase):
             self.assertIn((3, "DONE"), rows)
 
     def test_regular_protocol_flow(self):
+        """
+        Three INSERTS are sent to one participant node. Ensure transaction COMMITs
+        and final database contains three rows.
+        """
         self.coordinator.n_participants = 1
         self.coordinator.batch_size = 3
 
-        self.coordinator.setup()
-        self.participant.setup()
-
-        async def test(kill_at=None):
-
-            await self.trackMessage(self.coordinator.server, "PREPARE")
-            await self.trackMessage(self.coordinator.server, "DONE")
-            await self.trackMessage(self.participant.server, "BEGIN")
-            await self.trackMessage(self.participant.server, "INSERT")
-            await self.trackMessage(self.participant.server, "PREPARE")
-            await self.trackMessage(self.participant.server, "COMMIT")
-            await self.trackMessage(self.participant.server, "ABORT")
-
-            await self.coordinator.start()
-            await self.participant.start()
-            await self.coordinator.connect_to_participants()
-            await self.participant.connect_to_coordinator()
+        async def test():
+            await self.async_setup()
 
             participant_log_db_cur = self.participant_log_db.cursor()
 
@@ -147,10 +155,9 @@ class NodeTests(unittest.TestCase):
             row_c = ("sensorid", 0, t)
 
             insert_a_task = asyncio.create_task(self.coordinator.insert(*row_a))
-            await self.assertAwaitMessage(self.participant.server, "BEGIN")
+            await self.assertAwaitMessage(self.participant.server, "INSERT")
             trans_id = self.coordinator.current_trans_id
             self.assertEqual(self.participant.current_trans_id, trans_id)
-            await self.assertAwaitMessage(self.participant.server, "INSERT")
             await insert_a_task
 
             insert_b_task = asyncio.create_task(self.coordinator.insert(*row_b))
@@ -199,38 +206,113 @@ class NodeTests(unittest.TestCase):
 
         asyncio.run(test())
 
-    def test_err_protocol_flow_1(self):
-        pass
-        # assert prepare log written by coordinator
+    def test_dead_participant_flow(self):
+        """
+        An INSERT is sent to an alive node, but one dead participant node prevents
+        the system from committing.
+        Ensure transaction ABORTs and no data added to database.
+        """
+        self.coordinator.n_participants = 2
+        self.coordinator.participant_hosts.append(("localhost", "99999"))  # some bogus unreachable participant #2
+        self.coordinator.batch_size = 1
+        self.coordinator.timeout = 1
 
-        # kill coordinator
-        # bring coordinator back up
+        async def test():
+            await self.async_setup()
 
-        # assert prepare message sent coordinator -> participant
-        # assert prepare log written by participant
-        # assert commit message sent participant -> coordinator
-        # assert commit log written by coordinator
-        # assert commit message sent coordinator -> participant
-        # assert commit log written by participant
-        # assert commit executed by participant
-        # assert done message sent participant -> coordinator
-        # assert data table state correct
+            t = datetime.datetime.fromtimestamp(0).replace(microsecond=0)
+            row = (0, 0, t)  # hash(0) + hash(timestamp=0) maps to node #0
 
-    def test_err_protocol_flow_2(self):
-        pass
-        # assert prepare log written by coordinator
-        # assert prepare message sent coordinator -> participant
+            # INSERT sent
+            success = await self.coordinator.insert(*row)
+            self.assertEqual(success, True)
+            # INSERT to be received by node #0
+            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            # PREPARE to be received by node #0
+            await self.assertAwaitMessage(self.participant.server, "PREPARE")
+            trans_id = self.coordinator.current_trans_id
+            self.assertEqual(trans_id, self.participant.current_trans_id)
+            # PREPARED to be received by coordinator, but only from node #0
+            await self.assertAwaitMessage(self.coordinator.server, "PREPARE")
+            # Here, a timeout should occur while waiting for PREPARED from node #1
+            # Then, coordinator should send ABORT; wait for participant to receive it here
+            await self.assertAwaitMessage(self.participant.server, "ABORT")
+            self.assertEqual(self.participant.transactions[trans_id], "ABORTED")
+            # Coordinator to receive DONE from node #1, but not from node #2
+            await self.assertAwaitMessage(self.coordinator.server, "DONE")
 
-        # kill participant before receiving prepare message
+            # Check if final state of database ok
+            participant_data_db_cur = self.participant_data_db.cursor()
+            participant_data_db_cur.execute("select * from data")
+            rows = participant_data_db_cur.fetchall()
+            self.assertEqual(len(rows), 0)
 
-        # after timeout, assert abort message sent coordinator -> participant
+            await self.coordinator.stop()
+            await self.participant.stop()
 
-        # assert abort log written by coordinator
-        # assert commit message sent coordinator -> participant
-        # assert commit log written by participant
-        # assert commit executed by participant
-        # assert done message sent participant -> coordinator
-        # assert data table state correct
+        asyncio.run(test())
+
+    def test_recovering_participant_flow(self):
+        """
+        (1) Coordinator sents INSERT to alive participant.
+        (2) Participant promises to commit (sends PREPARED); then DIES.
+        (3) Coordinator receives PREPARED, sends COMMIT.
+            -> The participant does not see this COMMIT since it is dead.
+        (4) Participant comes back up. Reads log, re-sends PREPARED and receives COMMIT.
+
+        Ensure node recovers and data is stored.
+        """
+        self.coordinator.n_participants = 1
+        self.coordinator.batch_size = 1
+        self.coordinator.timeout = 1
+
+        async def test():
+            await self.async_setup()
+
+            async def dropper(data):
+                return
+            commit_cb = self.participant.server.handlers["COMMIT"]
+            self.participant.server.handlers["COMMIT"] = dropper
+
+            t = datetime.datetime.fromtimestamp(0).replace(microsecond=0)
+            row = ("hello world", 123, t)  # hash(0) + hash(timestamp=0) maps to node #0
+
+            # INSERT sent
+            success = await self.coordinator.insert(*row)
+            #self.assertEqual(success, True)
+            # INSERT and PREPARE to be received by node #0
+            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            await self.assertAwaitMessage(self.participant.server, "PREPARE")
+            trans_id = self.coordinator.current_trans_id
+            self.assertEqual(trans_id, self.participant.current_trans_id)
+
+            # After participant sends PREPARE, we KILL the participant
+            await self.assertAwaitMessage(self.coordinator.server, "PREPARE")
+            self.assertEqual(self.coordinator.transactions[trans_id], "COMMITTED")
+            # Drop receipt of COMMIT message; kill participant immediately thereafter
+            await self.participant.stop()
+            await asyncio.sleep(2)  # Give coordinator time to send COMMIT and then time out
+
+            # Bring participant back up
+            self.participant.server.handlers["COMMIT"] = commit_cb
+            await self.participant.start()
+            # Ensure participant sends correct message for recovery
+            await self.assertAwaitMessage(self.coordinator.server, "PREPARE")
+            # Ensure coordinator re-sends its decision to commit
+            await self.assertAwaitMessage(self.participant.server, "COMMIT")
+            await self.assertAwaitMessage(self.coordinator.server, "DONE")
+
+            # Check if final state of database ok
+            participant_data_db_cur = self.participant_data_db.cursor()
+            participant_data_db_cur.execute("select * from data")
+            rows = participant_data_db_cur.fetchall()
+            self.assertIn(row, rows)
+            self.assertEqual(len(rows), 1)
+
+            await self.coordinator.stop()
+            await self.participant.stop()
+
+        asyncio.run(test())
 
     def test_participant_setup(self):
         self.participant.setup()

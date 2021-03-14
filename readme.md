@@ -49,12 +49,22 @@ the `--node-id` argument. The coordinator node takes optional
 
 Start the coordinator:
 
-    python main.py --host localhost:9990 --participant localhost:9991 --participant localhost:9992
+    python main.py 
+      --host localhost:9990 
+      --participant localhost:9991 --participant localhost:9992
+      --log-db postgresql://localhost:8880
 
 Start the participants
 
-    python main.py --node-id 0 --host localhost:9991 --coordinator localhost:9990
+    python main.py 
+      --node-id 0 
+      --host localhost:9991
+      --coordinator localhost:9990
+      --log-db postgresql://localhost:8881
+      --data-db postgresql://localhost:8871
+    
     python main.py --node-id 1 --host localhost:9992 --coordinator localhost:9991
+    ...
 
 Start a client to interactively send insert requests to the coordinator:
 
