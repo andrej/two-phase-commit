@@ -68,7 +68,7 @@ class RemoteCallClient(RemoteCallUtils):
         self.reader: typing.Optional[asyncio.streams.StreamReader] = None
         self.writer: typing.Optional[asyncio.streams.StreamWriter] = None
         self.timeout = 10
-        self.read_tasks: typing.List[asyncio.Task] = []
+        self.lock = asyncio.Lock()
 
     async def connect(self):
         try:
@@ -79,8 +79,6 @@ class RemoteCallClient(RemoteCallUtils):
             return False
 
     async def disconnect(self):
-        for read_task in self.read_tasks:
-            read_task.cancel()
         if not self.writer or self.writer.is_closing():
             return
         self.writer.write_eof()
@@ -91,27 +89,27 @@ class RemoteCallClient(RemoteCallUtils):
         self.reader = None
 
     async def send(self, kind, data=None):
-        if not self.writer or self.writer.is_closing():
-            success = await self.connect()
-            if not success:
-                return None
-        self.logger.info(f"Sending remote call message to {self.server_host}:{self.server_port} of kind '{kind}': {json.dumps(data)}")
-        serialized = self.encode_message(kind, data)
-        ret = None
-        try:
-            self.writer.write(serialized)
-            await self.writer.drain()
-            read_task = asyncio.create_task(self.reader.readuntil(self.msg_separator))
-            self.read_tasks.append(read_task)
-            raw_ret = await read_task
-            ret = self.decode(raw_ret)
-            self.logger.info("Server replied: {}".format(json.dumps(ret)))
-        except (asyncio.streams.IncompleteReadError, json.JSONDecodeError, concurrent.futures.CancelledError) as e:
-            self.logger.error(f"Unexpected response from server.")
-            self.logger.error(str(e))
-        finally:
-            await self.disconnect()
-        return ret
+        async with self.lock:
+            if not self.writer or self.writer.is_closing():
+                success = await self.connect()
+                if not success:
+                    return None
+            self.logger.info(f"Sending remote call message to {self.server_host}:{self.server_port} of kind '{kind}': {json.dumps(data)}")
+            serialized = self.encode_message(kind, data)
+            ret = None
+            try:
+                self.writer.write(serialized)
+                await self.writer.drain()
+                await asyncio.sleep(0)
+                raw_ret = await self.reader.readuntil(self.msg_separator)
+                ret = self.decode(raw_ret)
+                self.logger.info("Server replied: {}".format(json.dumps(ret)))
+            except (asyncio.streams.IncompleteReadError, json.JSONDecodeError, concurrent.futures.CancelledError) as e:
+                self.logger.error(f"Unexpected response from server for request {kind}, {repr(data)}.")
+                self.logger.error(str(type(e)) + str(e))
+            finally:
+                await self.disconnect()
+            return ret
 
     async def send_timeout(self, kind, data=None):
         try:
@@ -133,7 +131,6 @@ class RemoteCallServer(RemoteCallUtils):
         super().__init__(server_host, server_port)
         self.handlers = {}
         self.server: typing.Optional[asyncio.AbstractServer] = None
-        self.reader_tasks = []
 
     def register_handler(self, kind: str, handler_cb: typing.Callable):
         if kind in self.handlers:
@@ -152,8 +149,6 @@ class RemoteCallServer(RemoteCallUtils):
 
     async def stop(self):
         self.logger.info("Stopping server.")
-        for reader_task in self.reader_tasks:
-            reader_task.cancel()
         self.server.close()
         await self.server.wait_closed()
 
@@ -173,9 +168,7 @@ class RemoteCallServer(RemoteCallUtils):
 
     async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            reader_task = asyncio.create_task(reader.readuntil(self.msg_separator))
-            self.reader_tasks.append(reader_task)
-            data_bytes: bytes = await reader_task
+            data_bytes = await reader.readuntil(self.msg_separator)
         except (asyncio.streams.IncompleteReadError, concurrent.futures.CancelledError):
             return
         try:

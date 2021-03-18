@@ -34,6 +34,9 @@ class NodeTests(unittest.TestCase):
             self.coordinator_log_db = self.coordinator_db_server.create_db_and_connect("coordinator_log")
             self.participant_log_db = self.participant_db_server.create_db_and_connect("participant_log")
             self.participant_data_db = self.participant_db_server.create_db_and_connect("participant_data")
+            with self.participant_data_db:
+                data_cur = self.participant_data_db.cursor()
+                data_cur.execute("CREATE TABLE IF NOT EXISTS data (column_a varchar(255), column_b int)")
 
             # Set up communications
             self.coordinator = node.TwoPhaseCommitCoordinator(self.coordinator_log_db,
@@ -53,7 +56,7 @@ class NodeTests(unittest.TestCase):
         await self.participant.setup()
         await self.trackMessage(self.coordinator.server, "PREPARE")
         await self.trackMessage(self.coordinator.server, "DONE")
-        await self.trackMessage(self.participant.server, "INSERT")
+        await self.trackMessage(self.participant.server, "EXECUTE")
         await self.trackMessage(self.participant.server, "PREPARE")
         await self.trackMessage(self.participant.server, "COMMIT")
         await self.trackMessage(self.participant.server, "ABORT")
@@ -136,7 +139,7 @@ class NodeTests(unittest.TestCase):
 
     def test_regular_protocol_flow(self):
         """
-        Three INSERTS are sent to one participant node. Ensure transaction COMMITs
+        Three EXECUTEs are sent to one participant node. Ensure transaction COMMITs
         and final database contains three rows.
         """
         self.coordinator.n_participants = 1
@@ -147,28 +150,28 @@ class NodeTests(unittest.TestCase):
 
             participant_log_db_cur = self.participant_log_db.cursor()
 
-            # 1. SEND INSERTS --------------------
+            # 1. SEND EXECUTEs --------------------
             # We register custom message wrappers to intercept the messages and make assertions
-            t = datetime.datetime.fromtimestamp(time.time()).replace(microsecond=0)
-            row_a = ("foobar123", 9999, t)
-            row_b = ("asdfasfd", 12345, t)
-            row_c = ("sensorid", 0, t)
+            query = "INSERT INTO data (column_a, column_b) VALUES (%s, %s)"
+            row_a = ("foobar123", 9999)
+            row_b = ("asdfasfd", 12345)
+            row_c = ("sensorid", 0)
 
-            insert_a_task = asyncio.create_task(self.coordinator.insert(*row_a))
-            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            insert_a_task = asyncio.create_task(self.coordinator.execute(0, query, row_a))
+            await self.assertAwaitMessage(self.participant.server, "EXECUTE")
             trans_id = self.coordinator.current_trans_id
             self.assertEqual(self.participant.current_trans_id, trans_id)
             await insert_a_task
 
-            insert_b_task = asyncio.create_task(self.coordinator.insert(*row_b))
-            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            insert_b_task = asyncio.create_task(self.coordinator.execute(0, query, row_b))
+            await self.assertAwaitMessage(self.participant.server, "EXECUTE")
             await insert_b_task
 
             # 2. PREPARE --------------------
 
-            insert_c_task = asyncio.create_task(self.coordinator.insert(*row_c))
+            insert_c_task = asyncio.create_task(self.coordinator.execute(0, query, row_c))
 
-            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            await self.assertAwaitMessage(self.participant.server, "EXECUTE")
             await asyncio.sleep(0)  # yield to coordinator
 
             await self.assertAwaitMessage(self.participant.server, "PREPARE")
@@ -195,7 +198,7 @@ class NodeTests(unittest.TestCase):
 
             # Check if final state of database ok
             participant_data_db_cur = self.participant_data_db.cursor()
-            participant_data_db_cur.execute("select sensor_id, measurement, timestamp from data")
+            participant_data_db_cur.execute("select * from data")
             rows = participant_data_db_cur.fetchall()
             self.assertIn(row_a, rows)
             self.assertIn(row_b, rows)
@@ -208,7 +211,7 @@ class NodeTests(unittest.TestCase):
 
     def test_dead_participant_flow(self):
         """
-        An INSERT is sent to an alive node, but one dead participant node prevents
+        An EXECUTE is sent to an alive node, but one dead participant node prevents
         the system from committing.
         Ensure transaction ABORTs and no data added to database.
         """
@@ -220,14 +223,14 @@ class NodeTests(unittest.TestCase):
         async def test():
             await self.async_setup()
 
-            t = datetime.datetime.fromtimestamp(0).replace(microsecond=0)
-            row = (0, 0, t)  # hash(0) + hash(timestamp=0) maps to node #0
+            query = "INSERT INTO data (column_a, column_b) VALUES (%s, %s)"
+            row = ('000', 0)  # hash(0) + hash(timestamp=0) maps to node #0
 
-            # INSERT sent
-            success = await self.coordinator.insert(*row)
+            # EXECUTE sent
+            success = await self.coordinator.execute(0, query, row)
             self.assertEqual(success, True)
-            # INSERT to be received by node #0
-            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            # EXECUTE to be received by node #0
+            await self.assertAwaitMessage(self.participant.server, "EXECUTE")
             # PREPARE to be received by node #0
             await self.assertAwaitMessage(self.participant.server, "PREPARE")
             trans_id = self.coordinator.current_trans_id
@@ -254,7 +257,7 @@ class NodeTests(unittest.TestCase):
 
     def test_recovering_participant_flow(self):
         """
-        (1) Coordinator sents INSERT to alive participant.
+        (1) Coordinator sents EXECUTE to alive participant.
         (2) Participant promises to commit (sends PREPARED); then DIES.
         (3) Coordinator receives PREPARED, sends COMMIT.
             -> The participant does not see this COMMIT since it is dead.
@@ -274,14 +277,14 @@ class NodeTests(unittest.TestCase):
             commit_cb = self.participant.server.handlers["COMMIT"]
             self.participant.server.handlers["COMMIT"] = dropper
 
-            t = datetime.datetime.fromtimestamp(0).replace(microsecond=0)
-            row = ("hello world", 123, t)  # hash(0) + hash(timestamp=0) maps to node #0
+            query = "INSERT INTO data (column_a, column_b) VALUES (%s, %s)"
+            row = ("hello world", 123)  # hash(0) + hash(timestamp=0) maps to node #0
 
-            # INSERT sent
-            success = await self.coordinator.insert(*row)
+            # EXECUTE sent
+            success = await self.coordinator.execute(0, query, row)
             #self.assertEqual(success, True)
-            # INSERT and PREPARE to be received by node #0
-            await self.assertAwaitMessage(self.participant.server, "INSERT")
+            # EXECUTE and PREPARE to be received by node #0
+            await self.assertAwaitMessage(self.participant.server, "EXECUTE")
             await self.assertAwaitMessage(self.participant.server, "PREPARE")
             trans_id = self.coordinator.current_trans_id
             self.assertEqual(trans_id, self.participant.current_trans_id)
@@ -316,15 +319,6 @@ class NodeTests(unittest.TestCase):
 
     def test_participant_setup(self):
         self.participant.setup()
-        with self.subTest("data table initialized correctly"):
-            data_cur = self.participant_data_db.cursor()
-            data_cur.execute("select table_name, column_name, data_type "
-                             "from information_schema.columns "
-                             "where table_schema = 'public'")
-            rows = data_cur.fetchall()
-            self.assertIn(("data", "sensor_id", "character varying"), rows)
-            self.assertIn(("data", "measurement", "integer"), rows)
-            self.assertIn(("data", "timestamp", "timestamp without time zone"), rows)
         with self.subTest("log table initialized correctly"):
             log_cur = self.participant_log_db.cursor()
             log_cur.execute("select table_name, column_name, data_type "

@@ -78,7 +78,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         self.participants: typing.List[comm.RemoteCallClient] = []
         self.timeout = timeout
         self.current_trans_id = None
-        self.insert_counter = 0
+        self.exec_counter = 0
         self.batch_size = 3
         self.prepared_to_commit: typing.Dict[int, typing.List[typing.Optional[bool]]] = {}
         self.done: typing.Dict[int, typing.List[typing.Optional[bool]]] = {}
@@ -91,7 +91,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
             self.participants.append(participant)
         self.server.register_handler("PREPARE", self.recv_prepare)
         self.server.register_handler("DONE", self.recv_done)
-        self.server.register_handler("INSERT", self.recv_insert)  # Client request
+        self.server.register_handler("EXECUTE", self.recv_execute)  # Client request
         self.everyone_prepared_event = asyncio.Event()
         self.initialize_log()
 
@@ -123,28 +123,26 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         if trans_id == self.current_trans_id and all(x is not None for x in self.prepared_to_commit[trans_id]):
             self.everyone_prepared_event.set()
 
-    async def recv_insert(self, data):
-        sensor_id = data["sensor_id"]
-        measurement = data["measurement"]
-        timestamp = datetime.datetime.fromtimestamp(data["timestamp"])
-        self.logger.info(f"Received INSERT ({sensor_id}, {measurement}, {timestamp}) request from client.")
-        await self.insert(sensor_id, measurement, timestamp)
+    async def recv_execute(self, data):
+        node_id = int(data["node_id"])
+        query = str(data["query"])
+        args = tuple(data["args"])
+        self.logger.info(f"Received EXECUTE ({query}) with args {args} for node {node_id} request from client.")
+        return await self.execute(node_id, query, args)
 
-    async def insert(self, sensor_id, measurement, timestamp: datetime.datetime):
-        if self.insert_counter == 0:
+    async def execute(self, node_id, query, args):
+        if self.exec_counter == 0:
             began = self.begin_transaction()
             if not began:
                 return False
-        node_i = (hash(sensor_id) + hash(timestamp.timestamp())) % len(self.participants)
-        participant = self.participants[node_i]
-        timestamp = time.mktime(timestamp.timetuple())
-        inserted = await participant.send_timeout("INSERT", (self.current_trans_id, sensor_id, measurement, timestamp))
-        if not inserted:
-            self.logger.error("INSERT did not reach destination node or was not successful.")
+        participant = self.participants[node_id]
+        executed = await participant.send_timeout("EXECUTE", (self.current_trans_id, query, args))
+        if not executed:
+            self.logger.error("EXECUTE did not reach destination node or was not successful.")
             return False
-        self.logger.info(f"Sent INSERT ({sensor_id}, {measurement}, {timestamp}) to participant {node_i}.")
-        self.insert_counter += 1
-        if self.insert_counter == self.batch_size:
+        self.logger.info(f"Sent EXECUTE ({query}) to participant {node_id}.")
+        self.exec_counter += 1
+        if self.exec_counter == self.batch_size:
             await self.complete_transaction()
         return True
 
@@ -157,7 +155,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         if not self.current_trans_id:
             self.current_trans_id = max(self.transactions.keys()) if self.transactions.keys() else 0
         if (self.current_trans_id in self.transactions
-                and self.transactions[self.current_trans_id] not in ["PREPARED", "COMMITTED", "ABORTED"]):
+                and self.transactions[self.current_trans_id] not in ["DONE", "PREPARED", "COMMITTED", "ABORTED"]):
             self.logger.error("May not BEGIN a new transaction; previous one has not completed yet.")
             return False
         self.current_trans_id += 1
@@ -165,7 +163,7 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
         return True
 
     async def complete_transaction(self):
-        self.insert_counter = 0
+        self.exec_counter = 0
         trans_id = self.current_trans_id
         # Send request-to-prepare messages
         # Write prepare to log (forced)
@@ -246,8 +244,8 @@ class TwoPhaseCommitCoordinator(TwoPhaseCommitNode):
 
     async def recv_done(self, data):
         node_id, trans_id = data
-        if (trans_id not in self.transactions or
-                self.transactions[trans_id] not in ["COMMITTED", "ABORTED"]):
+        if (trans_id in self.transactions and
+                self.transactions[trans_id] not in ["DONE", "COMMITTED", "ABORTED"]):
             self.logger.error(f"Illegal DONE message received from node {node_id} for transaction {trans_id}.")
             return
         self.set_done(trans_id, node_id)
@@ -285,7 +283,7 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
     A participant stores the actual data. For each transaction, we have the following
     states:
 
-    BEGUN: Transaction is accepting new insert requests. There should only be
+    BEGUN: Transaction is accepting new execute requests. There should only be
            one BEGUN transaction at a time (the current_trans_id).
     PREPARED: We have promised the coordinator to commit this transaction if
               he tells us to. The prepared transaction was written to disk.
@@ -308,7 +306,7 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         self.data_db_conn = data_db_conn
         self.data_db_conn.autocommit = True
         self.data_db_cur = self.data_db_conn.cursor()
-        self.server.register_handler("INSERT", self.recv_insert)
+        self.server.register_handler("EXECUTE", self.recv_execute)
         self.server.register_handler("PREPARE", self.recv_prepare)
         self.server.register_handler("COMMIT", self.recv_commit)
         self.server.register_handler("ABORT", self.recv_abort)
@@ -334,7 +332,7 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
 
     async def begin_transaction(self, trans_id):
         """
-        Begin a transaction. All following INSERTs will be associated with
+        Begin a transaction. All following EXECUTEs will be associated with
         this new transaction.
 
         We need to cover the following cases:
@@ -358,7 +356,7 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         # transaction, it may not be completed.
         if trans_id in self.transactions:
             if self.transactions[trans_id] != "BEGUN":
-                self.logger.error("Trying to append to transaction that is already completed or prepared.")
+                self.logger.error(f"Trying to append to transaction {trans_id} that is already completed or prepared.")
                 return False
 
         # Complete or abort previous transaction.
@@ -379,26 +377,29 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         self.logger.info(f"BEGAN new transaction {self.current_trans_id}.")
         return True
 
-    async def recv_insert(self, data):
+    async def recv_execute(self, data):
         """
-        Insert new data; may start a new transaction. We reject INSERTS
+        Execute the given query. May start a new transaction. We reject queries
         if the previous transaction was not successfully completed.
         """
-        trans_id, sensor_id, measurement, timestamp = data
+        trans_id, query, args = data
 
         if trans_id != self.current_trans_id:
             begun = await self.begin_transaction(trans_id)
             if not begun:
-                # This INSERT refers to an old transaction which we already completed.
+                # This EXECUTE refers to an old transaction which we already completed.
                 # With a sane coordinator, this should not happen; it will only move to
                 # the next transaction once the previous one is complete.
                 return False
 
-        timestamp = datetime.datetime.fromtimestamp(timestamp)
-        self.data_db_cur.execute("insert into data (sensor_id, measurement, timestamp) "
-                                 "values (%s, %s, %s)",
-                                 (sensor_id, measurement, timestamp))
-        self.logger.info(f"INSERT ({sensor_id}, {measurement}, {timestamp}) into database.")
+        self.logger.info(f"EXECUTE ({query}) for transaction {trans_id} in database.")
+        try:
+            self.data_db_cur.execute(query, args)
+            self.logger.info("Done.")
+        except psycopg2.Error as e:
+            self.do_abort(trans_id)
+            self.logger.error(f"EXECUTE failed: {str(e)}")
+            return False
         return True
 
     async def recv_prepare(self, trans_id):
@@ -435,7 +436,13 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         # `prepare transaction` stores transaction to disk.
         # After this, we can move on to other transactions, and still come
         # back to this and commit/rollback if needed.
-        self.data_db_cur.execute("prepare transaction %s", (str(trans_id),))
+        try:
+            self.data_db_cur.execute("prepare transaction %s", (str(trans_id),))
+        except psycopg2.Error as e:
+            self.logger.error(f"PREPARE failed in database.")
+            self.logger.error(str(e))
+            self.do_abort(trans_id)
+            return False
         self.transactions[trans_id] = "PREPARED"
         self.write_log()
 
@@ -457,6 +464,9 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
             self.logger.warning(f"Received redundant COMMIT; have already committed this transaction {trans_id}.")
             # Already committed the transaction
             pass
+        except psycopg2.Error as e:
+            self.logger.critical("Could not COMMIT!")
+            self.logger.critical(str(e))
         ack_done = await self.coordinator.send_timeout("DONE", (self.node_id, trans_id))
         self.logger.info(f"Sent DONE to coordinator.")
         #if ack_done:
@@ -479,16 +489,30 @@ class TwoPhaseCommitParticipant(TwoPhaseCommitNode):
         return True
 
     def do_abort(self, trans_id):
+        state = self.transactions.get(trans_id, None)
+        if state == "ABORTED":
+            self.logger.warning(f"Received redundant ABORT for transaction {trans_id} (in log).")
+            return
+        if state == "COMMITTED":
+            self.logger.critical(f"Cannot abort already COMMITTED transaction {trans_id}.")
+            return
         self.transactions[trans_id] = "ABORTED"
         self.write_log()
-        if trans_id == self.current_trans_id:
-            try:
+        try:
+            if trans_id == self.current_trans_id:
+                self.data_db_cur.execute("abort")
+            elif state == "PREPARED":
                 self.data_db_cur.execute("rollback prepared %s", (str(trans_id),))
-                self.logger.info(f"ABORTED {trans_id} in database.")
-            except psycopg2.errors.UndefinedObject:
-                self.logger.warning(f"Received redundant ABORT for transaction {trans_id}.")
-                # Already completed the transaction
-                pass
+            else:
+                assert False
+            self.logger.info(f"ABORTED {trans_id} in database.")
+        except psycopg2.errors.UndefinedObject:
+            self.logger.warning(f"Received redundant ABORT for transaction {trans_id}.")
+            # Already completed the transaction
+            pass
+        except psycopg2.Error as e:
+            self.logger.critical(f"Could not ABORT!")
+            self.logger.critical(e)
 
     async def recover(self):
         """
