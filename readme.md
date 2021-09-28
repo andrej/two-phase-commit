@@ -1,4 +1,18 @@
-# CS223 Project: Two-phase commit protocol implementation
+# Two-phase Commit Server Implementation
+
+This is a simple implementation of a 
+[two-phase commit protocol](https://en.wikipedia.org/wiki/Two-phase_commit_protocol) 
+in Python. Agents communicate through a RPC-like protocol that uses JSON for 
+serialization. Participant nodes write to a backing PostgreSQL database for 
+both logs and data.  Using logs and the two-phase commit protocol, atomicity 
+and consistency of writes to the database is ensured in a network of 
+non-byzantine, but possibly failing nodes.
+
+This program is the result of a project in the CS 223 Transaction Processing
+and Distributed Data Management course by at the University of California, 
+Irvine.
+
+**[Report](report/main.pdf)**
 
 ## Installation
 
